@@ -23,7 +23,7 @@ sys.path.insert(0, str(AGENTKIT))
 from pptx.enum.dml import MSO_LINE_DASH_STYLE  # noqa: E402
 from pptx.enum.shapes import MSO_SHAPE  # noqa: E402
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN  # noqa: E402
-from pptx.util import Pt  # noqa: E402
+from pptx.util import Inches, Pt  # noqa: E402
 
 from stylekit import icons, load_style, objects  # noqa: E402
 
@@ -109,6 +109,75 @@ def hex_chain(st_, s, x, y, w, h, items):
                 spacing=1.05)
         if i < n - 1:                               # стрелка от края контейнера до края соседнего
             st.arrow(s, cx + ow / 2, cy, cx + cw - ow / 2, cy, color='primary', lw=3)
+
+
+def slide_sub(st_, s, y, txt):
+    """Подзаголовок шапки в две строки. Зачем своё: st.slide отводит под sub 0,26 дюйма,
+    длинная фраза из этой рамки вылезает, и pp.py check считает это ошибкой."""
+    st_.text(s, st_.m, y, st_.w - 2 * st_.m, 0.56, txt, size='subtitle', color='text_soft')
+
+
+def circle_cycle(st_, s, cx, cy, rx, ry, names, node_w=2.05, node_h=0.62, start=-90):
+    """Цикл кольцом: этапы по эллипсу, дуги-стрелки по часовой стрелке, последний замыкается на первый.
+    Зачем своё: st.hex_flow рисует цикл цепочкой с двумя разворотами по краям, а не кольцом.
+    Дуги начинаются от края блока и упираются в край следующего: концы спрятаны под плашками.
+    start - угол первого этапа: -90 ставит его наверх, -60 разводит этапы по шести точкам эллипса, и
+    у всех шести пар остаётся длинная дуга (при этапе наверху боковые пары стоят вплотную)."""
+    n = len(names)
+    step = 360.0 / n
+
+    def pt(t):                                     # точка эллипса, 0 - справа, 90 - снизу
+        a = math.radians(t)
+        return cx + rx * math.cos(a), cy + ry * math.sin(a)
+
+    def box(i):
+        px, py = pt(start + i * step)              # от первого этапа дальше по часовой
+        return px - node_w / 2, py - node_h / 2
+
+    def inside(t, i, grow=0.0):
+        px, py = pt(t)
+        bx, by = box(i)
+        return bx - grow <= px <= bx + node_w + grow and by - grow <= py <= by + node_h + grow
+
+    for i in range(n):
+        a0, a1 = start + i * step, start + (i + 1) * step
+        t0 = a0
+        while t0 < a1 - 2 and inside(t0, i, 0.06):           # вышли из своей плашки
+            t0 += 0.5
+        t1 = a1
+        while t1 > t0 + 2 and inside(t1, (i + 1) % n):       # от центра следующей плашки назад до её края
+            t1 -= 0.5
+        t1 -= 0.5                                            # кончик острия - у самого края, не под плашкой
+        arc = [pt(t0 + (t1 - t0) * j / 18) for j in range(19)]
+        fb = s.shapes.build_freeform(Inches(arc[0][0]), Inches(arc[0][1]), scale=1.0)
+        fb.add_line_segments([(Inches(px), Inches(py)) for px, py in arc[1:]], close=False)
+        shp = fb.convert_to_shape()
+        shp.fill.background()
+        shp.line.color.rgb = st_.c('accent')
+        shp.line.width = Pt(2.25)
+        shp.shadow.inherit = False
+        (bx, by), (tx, ty) = pt(t1 - 4), arc[-1]    # остриё по касательной, кончик - на краю плашки
+        dx, dy = tx - bx, ty - by
+        ln = math.hypot(dx, dy) or 1
+        ux, uy = dx / ln, dy / ln
+        st_.poly(s, [(tx, ty), (tx - ux * 0.16 - uy * 0.075, ty - uy * 0.16 + ux * 0.075),
+                     (tx - ux * 0.16 + uy * 0.075, ty - uy * 0.16 - ux * 0.075)], fill='accent')
+    for i, name in enumerate(names):                       # плашки поверх концов дуг
+        bx, by = box(i)
+        st_.rect(s, bx, by, node_w, node_h, fill='primary', radius=0.10)
+        st_.text(s, bx + 0.1, by, node_w - 0.2, node_h, name, size='scheme', color='white', bold=True,
+                 align=C, anchor=M, spacing=0.95)
+
+
+def safeguards(st_, s, x, y, w, h, items, gap=0.22):
+    """Контур сохранности: три плашки в ряд, у каждой название и пояснение."""
+    cw = (w - gap * (len(items) - 1)) / len(items)
+    for i, (head, txt) in enumerate(items):
+        cx = x + i * (cw + gap)
+        st_.rect(s, cx, y, cw, h, fill='surface', line='line')
+        st_.rect(s, cx, y, 0.05, h, fill='accent')
+        st_.text(s, cx + 0.22, y + 0.06, cw - 0.4, 0.26, head, size='card_head', color='title', bold=True)
+        st_.text(s, cx + 0.22, y + 0.32, cw - 0.4, h - 0.40, txt, size='small', color='text_soft')
 
 
 def step_flow(st_, s, x, y, w, h, steps, note=None):
@@ -232,27 +301,29 @@ def interaction_scheme(st_, s, x, y, w, h, nodes, flows, bw=2.3, bh=0.95):
 
 
 def done_plans(st_, s, x, y, w, h, done, plans, gap=0.55):
-    """Две колонки: слева «сделано» с галочками, справа шаги со сроком.
+    """Две колонки: слева «сделано» с галочками (название и пояснение), справа шаги со сроком.
     Зачем своё: st.next_steps даёт одну колонку на всю ширину и стрелки с тенью."""
     lw = (w - gap) / 2
     rx = x + lw + gap
-    st.text(s, x, y, lw, 0.32, 'Сделано за курс', size='small', color='primary', bold=True,
-            caps=True, tracking=0.5)
-    st.text(s, rx, y, lw, 0.32, 'Дальше', size='small', color='primary', bold=True, caps=True,
-            tracking=0.5)
-    rh = (h - 0.55 - 0.18 * (len(done) - 1)) / len(done)
-    for i, txt in enumerate(done):
-        yy = y + 0.5 + i * (rh + 0.18)
-        st.rect(s, x, yy, lw, rh, fill='surface', line='line')
-        icons.icon_badge(st, s, x + 0.2, yy + (rh - 0.34) / 2, 0.34, 'check', fill='good', size=10)
-        st.text(s, x + 0.7, yy, lw - 0.9, rh, txt, size='body', color='text', anchor=M, spacing=1.05)
-    step = (h - 0.5) / len(plans)
+    st_.text(s, x, y, lw, 0.32, 'Сделано за курс', size='small', color='primary', bold=True,
+             caps=True, tracking=0.5)
+    st_.text(s, rx, y, lw, 0.32, 'Дальше', size='small', color='primary', bold=True, caps=True,
+             tracking=0.5)
+    rh = (h - 0.46 - 0.10 * (len(done) - 1)) / len(done)
+    for i, (head, body) in enumerate(done):
+        yy = y + 0.46 + i * (rh + 0.10)
+        st_.rect(s, x, yy, lw, rh, fill='surface', line='line')
+        icons.icon_badge(st_, s, x + 0.2, yy + (rh - 0.34) / 2, 0.34, 'check', fill='good', size=10)
+        st_.text(s, x + 0.74, yy + 0.08, lw - 0.96, 0.26, head, size=14, color='title', bold=True)
+        st_.text(s, x + 0.74, yy + 0.37, lw - 0.96, rh - 0.45, body, size='small', color='text',
+                 spacing=1.05)
+    step = (h - 0.46) / len(plans)
     for i, (when, what) in enumerate(plans):
-        yy = y + 0.5 + i * step
-        st.text(s, rx, yy + 0.02, 1.35, 0.34, when, size=13, color='primary', bold=True)
-        st.text(s, rx + 1.4, yy, lw - 1.4, step - 0.06, what, size=13, color='text', spacing=1.05)
+        yy = y + 0.46 + i * step
+        st_.text(s, rx, yy + 0.02, 1.35, 0.34, when, size=13, color='primary', bold=True)
+        st_.text(s, rx + 1.4, yy, lw - 1.4, step - 0.06, what, size=13, color='text', spacing=1.05)
         if i < len(plans) - 1:
-            st.line(s, rx, yy + step - 0.04, rx + lw, yy + step - 0.04, color='line', lw=0.75)
+            st_.line(s, rx, yy + step - 0.04, rx + lw, yy + step - 0.04, color='line', lw=0.75)
 
 
 def funnel_bands(s, x, y, w, h, stages, result=None):
@@ -297,7 +368,8 @@ def funnel_bands(s, x, y, w, h, stages, result=None):
 
 # ---------------------------------------------------------------- 1. титул
 s = st.cover(prs, 'Forja: от вайб-кодинга к продукту',
-             subtitle='Личная среда агентов, которая стала студией и продуктом',
+             subtitle='Рабочее пространство для специалистов: свои знания, готовые помощники, '
+                      'лучшие модели без настройки',
              date='01.11.2026', kicker='ZeroCoder · онлайн-выпускной',
              author='Хачатрян Сергей Арамович', position='Руководитель проектов')
 notes(s, 'Приветствие. Одна фраза о пути: за два месяца — от первого скрипта до продукта '
@@ -305,20 +377,22 @@ notes(s, 'Приветствие. Одна фраза о пути: за два �
 drop_shadows(s)
 
 # ---------------------------------------------------------------- 2. проблема
-# cards: три карточки в ряд; высота 2,30 под две строки текста, содержимое центровано.
-# conclusion_marked: знак «!» и заголовок внутри полосы слева, как на остальных слайдах.
-s = st.slide(prs, 'Проблема', 'Проблема: работа держится на руках',
-             sub='Модель пишет текст. Она не знает ваш проект.')
-cards(st, s, st.m, TOP, CW, 2.30, [
-    ('doc', 'Каждый документ — заново',
-     'Концепция, расчёт, доклад собираются с нуля руками. Часы на один выпуск.'),
-    ('search', 'ИИ отвечает общими словами',
-     'Без базы знаний агент выдаёт красивый, но пустой текст — не про ваш проект.'),
-    ('lock', 'Вендор закрыл доступ',
-     'Аккаунт заблокировали. Инструмент оказался чужим активом.'),
+# cards: три карточки в ряд; высота 2,55 под две строки текста, содержимое центровано.
+# slide_sub: подзаголовок в две строки, поэтому рисуется своим блоком 0,56 дюйма, а не полем sub.
+s = st.slide(prs, 'Проблема', 'ИИ был собеседником, стал исполнителем')
+slide_sub(st, s, 1.78, 'Раньше — чат: спросил, получил ответ, работу делал сам. Сегодня — '
+                       'инструмент, который знает мои документы, правила и проекты и доводит задачу '
+                       'до конца.')
+cards(st, s, st.m, 2.40, CW, 2.30, [
+    ('doc', 'Было: чат',
+     'Спросил — ответил. Контекст терялся, каждый раз с нуля.'),
+    ('search', 'Стало: среда',
+     'Библиотека знаний: документы, правила, история решений.'),
+    ('lock', 'Разница',
+     'Дело не в модели, а в том, к каким знаниям она подключена.'),
 ], cols=3, gap=0.28)
-conclusion_marked(s, 'Суть', 'Дело не в модели. Дело в **данных** и в процессе вокруг неё.',
-                  y=5.15, h=1.05)
+conclusion(s, 'Вывод', 'Работа не просто ускорилась — она перешла от меня к агенту.',
+           y=5.15, h=1.05)
 notes(s, '15 лет трансформационных проектов, команда из 5 аналитиков, материалы идут руководству '
          'корпорации. Каждый документ — ручная сборка.')
 drop_shadows(s)
@@ -341,14 +415,22 @@ notes(s, 'Показать, что первые проекты были учеб
 drop_shadows(s)
 
 # ---------------------------------------------------------------- 4. слой данных
-# step_flow: пять шагов, роль белой плашкой 12 pt внизу блока, стрелка 0,55 дюйма упирается в блоки.
-s = st.slide(prs, 'Блок 2 · Данные', 'Слой данных — фундамент',
-             sub='Агент не читает всё: индекс → файл → фрагмент')
-step_flow(st, s, st.m, TOP, CW, 3.00,
-          [('Вход', 'человек'), ('raw — оригинал', 'неизменен'), ('wiki — копия', 'агент'),
-           ('Индекс', 'поиск'), ('Фрагмент', 'ответ')],
-          note=(True, 'Оригинал не трогаем никогда'))
-conclusion(s, 'Основание', 'Метод Карпати — дисциплина данных, а не про ИИ.', y=5.55)
+# circle_cycle: шесть этапов кольцом по эллипсу (4,9 x 1,05) с угла -60: этапы стоят по шести точкам,
+# дуги-стрелки по часовой, замыкание последнего на первый идёт по верхней дуге; подпись этапа 13 pt.
+# safeguards: три плашки контура сохранности под кольцом, 0,56 дюйма на название и пояснение.
+s = st.slide(prs, 'Блок 2 · Слой данных', 'Знание возвращается в библиотеку',
+             sub='Материал проходит круг: разбор, обезличивание, индекс, работа, новое знание — и снова в библиотеку')
+circle_cycle(st, s, st.m + CW / 2, 3.45, 4.90, 1.05, [
+    'Материал', 'ingest: разбор', 'Обезличивание', 'Индекс', 'Работа агента', 'Новое знание',
+], start=-60)
+st.text(s, st.m + CW / 2 - 2.4, 3.27, 4.8, 0.36, 'Библиотека знаний', size='card_head',
+        color='primary', bold=True, align=C)
+safeguards(st, s, st.m, 4.88, CW, 0.56, [
+    ('Хуки', 'проверяют каждое действие'),
+    ('Страж', 'не пускает закрытое наружу'),
+    ('Бэкап', 'история версий'),
+])
+conclusion(s, 'Правило', 'Оригинал лежит в raw и не меняется. Работа идёт с копией.', y=5.58)
 notes(s, 'Ключевая мысль блока: слой данных — это то, что делает агента полезным. Модель '
          'подставляется любая.')
 drop_shadows(s)
@@ -382,7 +464,7 @@ _xe, _xl = st.m + SM_W, st.m + SM_W + 0.35       # край слоёв и отс
 st.line(s, _xe, _y1, _xl, _y1, color='primary', lw=1.5)
 st.line(s, _xl, _y1, _xl, _y3, color='primary', lw=1.5)
 st.arrow(s, _xl, _y3, _xe + 0.02, _y3, color='primary', lw=1.5)
-# метка «вызов» на обходной линии: 12 pt, шестиугольник по центру линии
+# метка «вызов» на обходной линии: 12 pt, шестигранник по центру линии
 _ty = (_y1 + _y3) / 2 - 0.15
 st.rect(s, _xl - 0.45, _ty, 0.9, 0.30, fill='deep', shape=MSO_SHAPE.HEXAGON)
 st.text(s, _xl - 0.45, _ty, 0.9, 0.30, 'вызов', size='small', color='white', align=C, anchor=M)
@@ -458,8 +540,8 @@ drop_shadows(s)
 # ---------------------------------------------------------------- 10. пазл
 # Решётка 2 x 2: номер и стрелка сверху, заголовок и пояснение сразу под ними (без пустого промежутка).
 s = st.slide(prs, 'Блок 6 · Итог', 'Пазл сложился: Forja AI Studio',
-             sub='Зверёк, студия, продукт и доска — четыре части одной идеи')
-_tiles = [('Forja', 'Зверёк и характер бренда: кузница, огонь, металл'),
+             sub='Среда, студия, продукт и доска — четыре части одной идеи')
+_tiles = [('Forja', 'Имя среды: задача превращается в результат'),
           ('Forja AI Studio', 'Студия: кто делает и по какой методе'),
           ('Forja Anvil', 'Продукт: рабочее место человека и агентов'),
           ('Forja Board', 'Доска, где задача уходит агенту')]
@@ -482,7 +564,7 @@ drop_shadows(s)
 # interaction_scheme: ромб - человек слева, Forja Anvil сверху, агент справа, модель в центре,
 # результат снизу; поток идёт по кругу. Стрелки - от границы блока до границы блока, подписи сбоку.
 s = st.slide(prs, 'Продукт', 'Forja Anvil: рабочее место человека и агентов',
-             sub='Скачал, подключил модель, поручил задачу — без терминала')
+             sub='Скачал, подключил модель, поручил задачу — настраивать нечего')
 interaction_scheme(st, s, st.m, 2.20, CW, 3.35, [
     dict(name='Человек', note='ставит задачу словами', x=0.0, y=0.5, kind='party'),
     dict(name='Forja Anvil', note='чат, проекты, файлы', x=0.5, y=0.0, kind='center'),
@@ -491,7 +573,8 @@ interaction_scheme(st, s, st.m, 2.20, CW, 3.35, [
     dict(name='Результат', note='принять или доработать', x=0.5, y=1.0, kind='party'),
 ], [(0, 1, 'задача'), (1, 2, 'поручение'), (2, 3, 'запрос'), (3, 2, 'ответ'),
     (2, 4, 'файл'), (4, 0, 'приёмка')], bw=2.3, bh=0.95)
-conclusion(s, 'Ценность', 'Пять минут от установки до первого результата.', y=5.66, h=0.90)
+conclusion(s, 'Суперсила', 'Свои знания + готовые помощники + любая модель без настройки',
+           y=5.66, h=0.90)
 st.footnote(s, 'Products/Nexa/CLAUDE.md:16-17; ТЗ агентов и наборов, 31.10.2026')
 notes(s, 'Ключевое отличие от чат-ботов: результат — файл, который можно отдать руководству, '
          'а не текст в окне.')
@@ -513,23 +596,25 @@ funnel_bands(s, st.m, TOP, CW, 3.22, [
 conclusion(s, 'Следующий шаг',
            'Дальше — свой сервер: подключение моделей из коробки, без настройки провайдеров.',
            y=5.55)
-st.footnote(s, 'Products/Nexa/CLAUDE.md:19-21; ТЗ 01.11.2026 (три товара, ранг кузни, юридическая рамка)')
+st.footnote(s, 'Products/Nexa/CLAUDE.md:19-21; ТЗ 01.11.2026 (три товара, игровой ранг, юридическая рамка)')
 notes(s, 'Не выдавать гипотезу за расчёт. Честно: цены взяты из проработки AgentKit, рынок не мерил.')
 drop_shadows(s)
 
 # ---------------------------------------------------------------- 13. итоги и планы
 # done_plans: две колонки - слева «сделано за курс» с галочками, справа шаги со сроком.
+# Колонка «сделано» начинается с 2,12: строка шапки с одной строкой подзаголовка кончается на 1,99.
 s = st.slide(prs, 'Что дальше', 'Итоги и планы', sub='Что получилось и куда идём')
-done_plans(st, s, st.m, 2.20, CW, 3.35,
-           ['Среда и слой данных: raw, wiki, индекс',
-            'Агенты и приложение: Forja, CoreDesk',
-            'Продукты: TayaBot, Teamboard, сайты, бот'],
-           [('Сейчас', 'Репозиторий: доклад, стиль, скилл, README'),
-            ('Ноябрь', 'Forja Anvil: бета для пяти аналитиков'),
+done_plans(st, s, st.m, 2.12, CW, 3.50,
+           [('Паки агентов', 'Автоматизировали рутинные задачи: чтение, поиск, документы, проверка'),
+            ('Среда и слой данных', 'Библиотека знаний, правила, хуки; смена модели за день'),
+            ('Продукты', 'CoreDesk и Forja, TayaBot, доска, сайты, бот')],
+           [('Ноябрь', 'Forja Anvil: бета для пяти аналитиков'),
             ('Декабрь', 'Forja Board: задача уходит агенту'),
             ('2027', 'Пять пилотов AgentKit')])
-conclusion(s, 'Смысл', 'Следующий проект можно начинать не с нуля.', y=5.66, h=0.90)
-notes(s, 'Показать репозиторий на экране. Планы — конкретные, с одним сроком.')
+conclusion(s, 'Смысл', 'Следующий проект — не с нуля.', y=5.68, h=0.90)
+st.footnote(s, 'Репозиторий: github.com/khsergey-afk/forja-zerocoder')
+notes(s, 'Репозиторий: доклад, стиль, скилл, README — показать на экране. Планы — конкретные, '
+         'с одним сроком.')
 drop_shadows(s)
 
 # ---------------------------------------------------------------- 14. спасибо
